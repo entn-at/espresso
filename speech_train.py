@@ -78,7 +78,6 @@ def main(args, init_distributed=False):
     lr = trainer.get_lr()
     train_meter = StopwatchMeter()
     train_meter.start()
-    valid_losses = [None]
     valid_subsets = args.valid_subset.split(',')
     while (
         (lr >= args.min_lr or trainer.get_num_updates() <= getattr(args, 'warmup_updates', 0))
