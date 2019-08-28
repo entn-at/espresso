@@ -59,6 +59,8 @@ def main(args):
                 print('| LM fusion with Multi-level LM')
             else:
                 models[i] = LookAheadWordLanguageModel(m, dict,
+                    spm_model=args.spm_model,
+                    bpe_symbol=args.remove_bpe,
                     oov_penalty=args.oov_penalty,
                     open_vocab=not args.disable_open_vocab)
                 print('| LM fusion with Look-ahead Word LM')
@@ -232,6 +234,12 @@ def cli_main():
     parser.add_argument('--subwordlm-weight', default=0.8, type=float, metavar='W',
                         help='subword LM weight relative to word LM. Only relevant '
                         'to MultiLevelLanguageModel as an external LM')
+    parser.add_argument('--spm-model', default=None, type=str, metavar='PATH',
+                        help='path to the sentencepiece model. if provided, it '
+                        'will be used to tokenize each word into subword pieces '
+                        'for the subword version of look-ahead LM; otherwise the '
+                        'letter version will be used. Should be compatible with '
+                        'the actual type of the modeling units being used')
     parser.add_argument('--oov-penalty', default=1e-4, type=float,
                         help='oov penalty with the pretrained external LM')
     parser.add_argument('--disable-open-vocab', action='store_true',

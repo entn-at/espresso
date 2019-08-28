@@ -32,9 +32,14 @@ class LookAheadWordLanguageModel(FairseqLanguageModel):
     """A :class:`fairseq.models.FairseqLanguageModel` wrapper for
     :class:`_LookAheadWordLanguageModelDecoder`.
     """
-    def __init__(self, wordlm, subword_dict, oov_penalty=1e-4, open_vocab=True):
-        decoder = _LookAheadWordLanguageModelDecoder(wordlm, subword_dict,
-            oov_penalty, open_vocab)
+    def __init__(self, wordlm, subword_dict, spm_model=None, bpe_symbol='sentencepiece',
+        oov_penalty=1e-4, open_vocab=True):
+        if spm_model is None or spm_model == '':
+            decoder = LookAheadWordLanguageModelDecoder(wordlm, subword_dict,
+                oov_penalty, open_vocab)
+        else:
+            decoder = _SubwordLookAheadWordLanguageModelDecoder(wordlm, subword_dict,
+                spm_model, bpe_symbol, oov_penalty, open_vocab)
         super().__init__(decoder)
 
 
@@ -154,10 +159,9 @@ class _LookAheadWordLanguageModelDecoder(FairseqIncrementalDecoder):
             out_probs[~batch_space_mask, :, self.subword_eos_idx] = self.zero
             # set transition probability to 1 for those whose node is out of the
             # tree, i.e. node is None (case 4 in Eqn. 15)
-            batch_node_none_mask = []
-            for node in nodes:
-                batch_node_none_mask.append(node is None)
-            batch_node_none_mask = batch_space_mask.new(batch_node_none_mask)
+            batch_node_none_mask = batch_space_mask.new(
+                [node is None for node in nodes]
+            )
             out_probs[batch_node_none_mask] = 1.
         else:
             # set out_probs to 0
@@ -264,6 +268,202 @@ class _LookAheadWordLanguageModelDecoder(FairseqIncrementalDecoder):
 
     def max_positions(self):
         return int(1e5)  # an arbitrary large number
+
+
+class _SubwordLookAheadWordLanguageModelDecoder(_LookAheadWordLanguageModelDecoder):
+    """Look-ahead word language model decoder with subword units for end-to-end ASR.
+    It is intended to be used for beam search decoding. See <LINK> for details.
+    """
+    def __init__(self, wordlm, subword_dict, spm_model, bpe_symbol='sentencepiece',
+        oov_penalty=1e-4, open_vocab=True):
+        super().__init__(wordlm.decoder.dictionary)
+
+        assert isinstance(wordlm, FairseqLanguageModel)
+        self.lm_decoder = wordlm.decoder
+        assert hasattr(self.lm_decoder, 'masked_copy_incremental_state') and \
+            callable(self.lm_decoder.masked_copy_incremental_state), \
+            'The wrapped decoder should implement masked_copy_incremental_state()'
+        self.oov_penalty = oov_penalty
+        self.open_vocab = open_vocab
+        self.zero = 1e-10 # a sufficiently small value to avoid the log(0) issue
+
+        word_dict = self.lm_decoder.dictionary
+        assert isinstance(word_dict, TokenDictionary)
+        self.word_pad_idx = word_dict.pad()
+        self.word_eos_idx = word_dict.eos()
+        self.word_unk_idx = word_dict.unk()
+
+        assert isinstance(subword_dict, TokenDictionary)
+        self.subword_pad_idx = subword_dict.pad()
+        self.subword_eos_idx = subword_dict.eos()
+        self.subword_vocab_size = len(subword_dict)
+
+        try:
+            import sentencepiece as spm
+            sp = spm.SentencePieceProcessor()
+            sp.Load(spm_model)
+        except ImportError:
+            raise ImportError('Please install sentencepiece with: pip install sentencepiece')
+        tokenizer = lambda x: sp.EncodeAsPieces(x)
+        self.lexroot = lexical_prefix_tree(word_dict, subword_dict, tokenizer)
+
+        word_end_symbol = '\u2581' if bpe_symbol == 'sentencepiece' else bpe_symbol.strip()
+        self.word_end_flag = torch.tensor(
+            [subword_dict[i].endswith(word_end_symbol) for i in range(self.subword_vocab_size)]  # V
+        )
+
+        def max_out_degree(node):
+            if len(node.children) == 0:
+                return 0
+            cur_max = len(node.children)
+            for _, node in node.children.items():
+                cur_max = max(cur_max, max_out_degree(node))
+            return cur_max
+
+        self.max_num_children = max_out_degree(self.lexroot)
+        assert self.max_num_children <= self.subword_vocab_size
+
+    @torch.no_grad()
+    def forward(self, prev_output_tokens, encoder_out=None, incremental_state=None):
+        assert incremental_state is not None, \
+            'this model is for incremental decoding only'
+        prev_output_tokens = prev_output_tokens[:, -1:]
+        bsz = prev_output_tokens.size(0)
+
+        cached_state = utils.get_incremental_state(
+            self.lm_decoder, incremental_state, 'cached_state')
+
+        if cached_state is None: # it is the first time step
+            assert (prev_output_tokens == self.subword_eos_idx).all(), \
+                'expecting the input to the first time step to be <eos>'
+            w = prev_output_tokens.new_full([bsz, 1], self.word_eos_idx)
+            lm_probs = self.lm_decoder.get_normalized_probs(
+                self.lm_decoder(w, incremental_state=incremental_state),
+                log_probs=False, sample=None)  # B x 1 x V
+            cumsum_probs = torch.cumsum(lm_probs, dim=-1)  # B x 1 x V
+            nodes = [self.lexroot] * bsz
+            prev_word_end_mask = w.new_zeros(bsz).eq(-1)  # all False; size of B
+        else:
+            cumsum_probs = utils.get_incremental_state(
+                self, incremental_state, 'cumsum_probs')
+            nodes = utils.get_incremental_state(self, incremental_state, 'nodes')
+            assert len(nodes) == bsz
+            tokens_list = prev_output_tokens.squeeze(-1).tolist()
+            for i in range(bsz):
+                if nodes[i] is not None:
+                    if nodes[i].word_idx >= 0:
+                        # if prev token in the last step is word-end, go to root
+                        nodes[i] = self.lexroot
+                    if tokens_list[i] in nodes[i].children:
+                        # intra-word transition: go to child
+                        nodes[i] = nodes[i].children[tokens_list[i]]
+                    else:
+                        # oov path
+                        nodes[i] = None
+                if nodes[i] is None and self.word_end_flag[tokens_list[i]]:
+                    # if no path in the tree and prev token is word-end, go back to root
+                    nodes[i] = self.lexroot
+
+            w = prev_output_tokens.new([
+                node.word_idx if node is not None and node.word_idx >= 0 else \
+                self.word_unk_idx for node in nodes
+            ]).unsqueeze(-1) # B x 1
+            prev_word_end_mask = self.word_end_flag.gather(0, prev_output_tokens.squeeze(-1))
+            old_cached_state = _clone_cached_state(cached_state)
+            # recompute cumsum_probs from inter-word transition probabilities
+            # only for those whose prev_output_token is word-end. Note that
+            # compared with the letter version above, we move this whole block
+            # after the nodes state update code, in order to be compatible with
+            # the new situation where word-end is part of the word (rather than
+            # the stand-alone <space> symbol)
+            lm_probs = self.lm_decoder.get_normalized_probs(
+                self.lm_decoder(w, incremental_state=incremental_state),
+                log_probs=False, sample=None)  # B x 1 x V
+            self.lm_decoder.masked_copy_incremental_state(incremental_state,
+                old_cached_state, prev_word_end_mask)  # restore those not masked
+            cumsum_probs[prev_word_end_mask] = \
+                torch.cumsum(lm_probs, dim=-1)[prev_word_end_mask]
+
+        utils.set_incremental_state(
+            self, incremental_state, 'cumsum_probs', cumsum_probs)
+        utils.set_incremental_state(self, incremental_state, 'nodes', nodes)
+
+        # initialize out_probs (B x 1 x V)
+        if self.open_vocab:
+            # set out_probs to oov_penalty * P(<unk>|h) (case 3 in Eqn. 15)
+            out_probs = self.oov_penalty * (
+                cumsum_probs[:, :, self.word_unk_idx] - \
+                cumsum_probs[:, :, self.word_unk_idx - 1]
+            ).unsqueeze(-1).repeat(1, 1, self.subword_vocab_size)
+            # set the probability of emitting <eos> to 0 if prev_output_tokens
+            # is not word-end
+            out_probs[~prev_word_end_mask, :, self.subword_eos_idx] = self.zero
+            # set transition probability to 1 for those whose node is out of the
+            # tree but has not encountered word-end, i.e. node is None (case 4 in Eqn. 15)
+            batch_node_none_mask = prev_word_end_mask.new(
+                [node is None for node in nodes]
+            )
+            out_probs[batch_node_none_mask] = 1.
+        else:
+            # set out_probs to 0
+            out_probs = cumsum_probs.new_full([bsz, 1, self.subword_vocab_size],
+                self.zero)
+
+        # compute parent probabilities for those whose node is not None
+        sum_probs = cumsum_probs.new_full([bsz, 1], 1.) # default for root node
+        left_ranges, right_ranges, batch_node_not_root_mask = [], [], []
+        for node in nodes:
+            if node is not None and node.word_set is not None:
+                left_ranges.append([node.word_set[0]])
+                right_ranges.append([node.word_set[1]])
+                batch_node_not_root_mask.append(True)
+            else:
+                batch_node_not_root_mask.append(False)
+        if len(left_ranges) > 0:
+            # b x 1 x 1
+            left_ranges = prev_output_tokens.new(left_ranges).unsqueeze(-1)
+            right_ranges = prev_output_tokens.new(right_ranges).unsqueeze(-1)
+            batch_node_not_root_mask = prev_word_end_mask.new(batch_node_not_root_mask)
+            sum_probs[batch_node_not_root_mask] = (
+                cumsum_probs[batch_node_not_root_mask].gather(-1, right_ranges) - \
+                cumsum_probs[batch_node_not_root_mask].gather(-1, left_ranges)
+            ).squeeze(-1)
+
+        # compute transition probabilities to child nodes (case 2 in Eqn. 15)
+        subword_idx = [[self.subword_pad_idx] * self.max_num_children \
+            for _ in range(bsz)]
+        left_ranges = [[self.word_pad_idx] * self.max_num_children \
+            for _ in range(bsz)]
+        right_ranges = [[self.word_pad_idx] * self.max_num_children \
+            for _ in range(bsz)]
+        for i in range(bsz):
+            node = nodes[i]
+            if node is not None and len(node.children) > 0:
+                for j, (sidx, child) in enumerate(node.children.items()):
+                    subword_idx[i][j] = sidx
+                    left_ranges[i][j] = child.word_set[0]
+                    right_ranges[i][j] = child.word_set[1]
+        # B x 1 x max_num_children
+        subword_idx = prev_output_tokens.new(subword_idx).unsqueeze(1)
+        left_ranges = prev_output_tokens.new(left_ranges).unsqueeze(1)
+        right_ranges = prev_output_tokens.new(right_ranges).unsqueeze(1)
+        cumsum_probs_children = (cumsum_probs.gather(-1, right_ranges) - \
+            cumsum_probs.gather(-1, left_ranges)) / sum_probs.unsqueeze(-1)
+        cumsum_probs_children[sum_probs.squeeze(-1) < self.zero, :, :] = self.zero
+        out_probs.scatter_(-1, subword_idx, cumsum_probs_children)
+        out_probs[:, :, self.subword_pad_idx] = self.zero
+
+        # take log of probs and clip it from below to avoid log(0)
+        out_logprobs = torch.max(out_probs, out_probs.new([self.zero])).log_()
+
+        # assign log-probs of emitting word <eos> to that of emitting word-end
+        out_logprobs[prev_word_end_mask, :, self.subword_eos_idx] = \
+            lm_probs.log_()[prev_word_end_mask, :, self.word_eos_idx]
+
+        # note that here we return log-probs rather than logits, and the second
+        # element is None, which is usually a tensor of attention weights in
+        # attention-based models
+        return out_logprobs, None
 
 
 class MultiLevelLanguageModel(FairseqLanguageModel):

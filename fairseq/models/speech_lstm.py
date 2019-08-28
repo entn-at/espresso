@@ -806,6 +806,18 @@ def lstm_wordlm_wsj(args):
     base_lm_architecture(args)
 
 
+@register_model_architecture('lstm_lm', 'lstm_wordlm_swbd')
+def lstm_wordlm_wsj(args):
+    args.dropout = getattr(args, 'dropout', 0.3)
+    args.decoder_embed_dim = getattr(args, 'decoder_embed_dim', 1800)
+    args.decoder_hidden_size = getattr(args, 'decoder_hidden_size', 1800)
+    args.decoder_layers = getattr(args, 'decoder_layers', 3)
+    args.decoder_out_embed_dim = getattr(args, 'decoder_out_embed_dim', 1800)
+    args.share_embed = getattr(args, 'share_embed', True)
+    args.is_wordlm = True
+    base_lm_architecture(args)
+
+
 @register_model_architecture('speech_lstm', 'speech_lstm')
 def base_architecture(args):
     args.dropout = getattr(args, 'dropout', 0.4)
